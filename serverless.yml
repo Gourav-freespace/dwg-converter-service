@@ -1,0 +1,97 @@
+service: dwg-converter-service
+configValidationMode: error
+frameworkVersion: "3"
+useDotenv: true
+
+plugins:
+  - serverless-offline
+  - serverless-esbuild
+
+provider:
+  name: aws
+  stage: ${opt:stage, 'qa'}
+  region: ${opt:region, 'eu-west-1'}
+  runtime: nodejs20.x
+  versionFunctions: false
+  iam:
+    role:
+      statements:
+        - Effect: "Allow"
+          Action:
+            - "s3:PutObject"
+          Resource:
+            - "arn:aws:s3:::${env:DXF_S3_BUCKET}/*"
+  environment:
+    STAGE: ${self:provider.stage}
+    REGION: ${self:provider.region}
+  apiGateway:
+    apiKeySourceType: AUTHORIZER
+    minimumCompressionSize: 1024
+    binaryMediaTypes:
+      - "multipart/form-data"
+
+package:
+  individually: true
+
+custom:
+  esbuild:
+    bundle: true
+    minify: true
+    sourcemap: true
+    target: "node20"
+    platform: "node"
+    concurrency: 10
+    # dwg2dxf-converter stays external so its .wasm assets ship intact in
+    # node_modules instead of being inlined (esbuild cannot bundle them).
+    external: ["dwg2dxf-converter"]
+    loader: { ".ts": "ts" }
+    tsconfig: "tsconfig.json"
+    packager: "npm"
+  serverless-offline:
+    noPrependStageInUrl: true
+    reloadHandler: true
+
+functions:
+  dwgConverter:
+    name: ${self:provider.stage}-dwg-converter
+    handler: src/functions/dwg-converter.dwgConverterHandler
+    # Conversion is memory-heavy: an 8 MB DWG produces an 80 MB DXF that is
+    # buffered, stashed, and uploaded to S3 in one invocation.
+    memorySize: 2048
+    reservedConcurrency: 5
+    timeout: 900
+    description: "DWG to DXF conversion lambda"
+    layers:
+      - Ref: DwgConverterLambdaLayer
+    events:
+      - http: "OPTIONS /convert-dwg-to-dxf"
+      - http:
+          path: convert-dwg-to-dxf
+          method: post
+          # Reuses the vector-service token authorizer so callers use the
+          # same Freespace JWT. The name follows serverless's default
+          # function naming: <service>-<stage>-<fnKey>. Adjust if the
+          # authorizer moves.
+          authorizer:
+            arn: arn:aws:lambda:${self:provider.region}:${aws:accountId}:function:vector-service-${self:provider.stage}-authorizerFunc
+            identitySource: method.request.header.Authorization
+            type: token
+    environment:
+      AWS_NODEJS_CONNECTION_REUSE_ENABLED: 1
+      NODE_OPTIONS: "--enable-source-maps --stack-trace-limit=1000 --trace-warnings"
+      # Deployed default: the dwg2dxf binary from the layer (layers mount at
+      # /opt). Locally, .env overrides this with the brew binary. The WASM
+      # engine only runs when this is empty AND no binary is on PATH; avoid
+      # that, it drops entities (LibreDWG 0.13.4).
+      DWG_CONVERTER_PATH: ${env:DWG_CONVERTER_PATH, '/opt/bin/dwg2dxf'}
+      # Destination bucket for converted DXF files.
+      DXF_S3_BUCKET: ${env:DXF_S3_BUCKET, ''}
+      DXF_S3_BUCKET_REGION: ${env:DXF_S3_BUCKET_REGION, '${self:provider.region}'}
+
+layers:
+  dwgConverter:
+    path: layers/dwg-converter
+    name: ${self:provider.stage}-dwg2dxf
+    description: "LibreDWG 0.14 dwg2dxf binary (Amazon Linux x86_64) for DWG->DXF conversion"
+    compatibleRuntimes:
+      - nodejs20.x
