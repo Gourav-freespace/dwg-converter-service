@@ -19,10 +19,16 @@ provider:
         - Effect: "Allow"
           Action:
             - "s3:PutObject"
+            - "s3:GetObject"
           # Unset locally is fine (offline ignores IAM). Deploys must set
           # DXF_S3_BUCKET; the placeholder keeps the ARN valid either way.
           Resource:
             - "arn:aws:s3:::${env:DXF_S3_BUCKET, 'dxf-bucket-not-configured'}/*"
+        - Effect: "Allow"
+          Action:
+            - "lambda:InvokeFunction"
+          Resource:
+            - "arn:aws:lambda:${self:provider.region}:${aws:accountId}:function:${self:provider.stage}-dxf-to-geojson"
   environment:
     STAGE: ${self:provider.stage}
     REGION: ${self:provider.region}
@@ -67,6 +73,7 @@ functions:
       - Ref: DwgConverterLambdaLayer
     events:
       - http: "OPTIONS /convert-dwg-to-dxf"
+      - http: "OPTIONS /convert-dwg-to-geojson"
       - http:
           path: convert-dwg-to-dxf
           method: post
@@ -74,6 +81,13 @@ functions:
           # same Freespace JWT. The name follows serverless's default
           # function naming: <service>-<stage>-<fnKey>. Adjust if the
           # authorizer moves.
+          authorizer:
+            arn: arn:aws:lambda:${self:provider.region}:${aws:accountId}:function:vector-service-${self:provider.stage}-authorizerFunc
+            identitySource: method.request.header.Authorization
+            type: token
+      - http:
+          path: convert-dwg-to-geojson
+          method: post
           authorizer:
             arn: arn:aws:lambda:${self:provider.region}:${aws:accountId}:function:vector-service-${self:provider.stage}-authorizerFunc
             identitySource: method.request.header.Authorization
@@ -89,6 +103,27 @@ functions:
       # Destination bucket for converted DXF files.
       DXF_S3_BUCKET: ${env:DXF_S3_BUCKET, ''}
       DXF_S3_BUCKET_REGION: ${env:DXF_S3_BUCKET_REGION, '${self:provider.region}'}
+      # GeoJSON pipeline. Deployed: the Node lambda invokes the Python
+      # lambda below (DXF handed over via S3). Local: set GEOJSON_PY_LOCAL=1
+      # to spawn python/handler.py directly with PYTHON_BIN.
+      GEOJSON_LAMBDA_NAME: ${self:provider.stage}-dxf-to-geojson
+      GEOJSON_PY_LOCAL: ${env:GEOJSON_PY_LOCAL, ''}
+      PYTHON_BIN: ${env:PYTHON_BIN, 'python3'}
+  dxfToGeojson:
+    name: ${self:provider.stage}-dxf-to-geojson
+    handler: python/handler.lambda_handler
+    runtime: python3.11
+    # The raster wall/room tracing is numpy-heavy; give it room.
+    memorySize: 3008
+    reservedConcurrency: 5
+    timeout: 900
+    description: "DXF to Freespace GeoJSON (floorplan-editor engine)"
+    package:
+      patterns:
+        - "!./**"
+        - "python/**"
+    environment:
+      PYTHONPATH: /var/task/python/vendor:/var/task/python/engine
 
 layers:
   dwgConverter:

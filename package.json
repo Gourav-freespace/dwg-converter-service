@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "DWG to DXF conversion API (Serverless, TypeScript)",
   "scripts": {
-    "dev": "serverless offline start",
+    "dev": "serverless offline start --httpPort 4000",
     "offline": "serverless offline start",
     "test": "jest --verbose",
     "lint": "eslint . --ext .ts",
@@ -13,6 +13,7 @@
     "deploy:prod": "serverless deploy --stage prod"
   },
   "dependencies": {
+    "@aws-sdk/client-lambda": "^3.1147.0",
     "@aws-sdk/client-s3": "^3.823.0",
     "aws-multipart-parser": "^0.2.1",
     "dwg2dxf-converter": "1.0.4"

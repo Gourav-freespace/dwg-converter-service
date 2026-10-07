@@ -10,6 +10,7 @@ import {
   DwgConversionError,
   isDwgBuffer,
 } from "../services/dwg-converter-service";
+import { dxfToGeojson } from "../services/geojson-pipeline";
 
 interface ParsedFile {
   filename: string;
@@ -25,15 +26,19 @@ const INLINE_LIMIT_BYTES = 5 * 1024 * 1024;
 const stashDir = (): string =>
   process.env.DXF_STASH_DIR ?? path.join(os.tmpdir(), "dwg-dxf-stash");
 
-const stashDxf = async (
+const stashFile = async (
   baseName: string,
-  dxf: Buffer
+  data: Buffer,
+  extension = "dxf"
 ): Promise<string | null> => {
   try {
     const dir = stashDir();
     await fs.mkdir(dir, { recursive: true });
-    const localPath = path.join(dir, `${Date.now()}-${baseName}.dxf`);
-    await fs.writeFile(localPath, dxf);
+    const localPath = path.join(
+      dir,
+      `${Date.now()}-${baseName}.${extension}`
+    );
+    await fs.writeFile(localPath, data);
     return localPath;
   } catch {
     // The stash is a convenience copy; never fail the request over it.
@@ -47,28 +52,37 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "*",
 };
 
-const convertEndpoint = async (
-  event: APIGatewayProxyEvent
-): Promise<APIGatewayProxyResult> => {
+type UploadOrError =
+  | { ok: true; filename: string; content: Buffer }
+  | { ok: false; errorResponse: APIGatewayProxyResult };
+
+const parseDwgUpload = (event: APIGatewayProxyEvent): UploadOrError => {
   let file: ParsedFile | undefined;
   try {
     const parsedData = parse(event, true);
     file = parsedData.file as ParsedFile;
   } catch (parseError) {
     console.error("Error parsing multipart data:", parseError);
-    return response(400, {
-      success: false,
-      error: "Invalid file upload",
-      details: "Could not parse uploaded file.",
-    });
+    return {
+      ok: false,
+      errorResponse: response(400, {
+        success: false,
+        error: "Invalid file upload",
+        details: "Could not parse uploaded file.",
+      }),
+    };
   }
 
   if (!file || !file.content) {
-    return response(400, {
-      success: false,
-      error: "No file uploaded",
-      details: 'Send the DWG as multipart form-data under the field name "file".',
-    });
+    return {
+      ok: false,
+      errorResponse: response(400, {
+        success: false,
+        error: "No file uploaded",
+        details:
+          'Send the DWG as multipart form-data under the field name "file".',
+      }),
+    };
   }
 
   const content = Buffer.isBuffer(file.content)
@@ -76,12 +90,27 @@ const convertEndpoint = async (
     : Buffer.from(file.content);
 
   if (!file.filename?.toLowerCase().endsWith(".dwg") || !isDwgBuffer(content)) {
-    return response(400, {
-      success: false,
-      error: "File must be a DWG drawing",
-      details: "The file needs a .dwg extension and a valid DWG header (AC10xx).",
-    });
+    return {
+      ok: false,
+      errorResponse: response(400, {
+        success: false,
+        error: "File must be a DWG drawing",
+        details:
+          "The file needs a .dwg extension and a valid DWG header (AC10xx).",
+      }),
+    };
   }
+
+  return { ok: true, filename: file.filename, content };
+};
+
+const convertEndpoint = async (
+  event: APIGatewayProxyEvent
+): Promise<APIGatewayProxyResult> => {
+  const upload = parseDwgUpload(event);
+  if (!upload.ok) return upload.errorResponse;
+  const { filename, content } = upload;
+  const file = { filename };
 
   try {
     console.info(
@@ -95,7 +124,7 @@ const convertEndpoint = async (
     const baseName = file.filename.replace(/\.dwg$/i, "");
 
     // Keep a temporary local copy regardless of output mode.
-    const localPath = await stashDxf(baseName, result.dxf);
+    const localPath = await stashFile(baseName, result.dxf);
     if (localPath) {
       console.info(`DXF stashed locally at ${localPath}`);
     } else {
@@ -166,6 +195,85 @@ const convertEndpoint = async (
   }
 };
 
+const convertToGeojsonEndpoint = async (
+  event: APIGatewayProxyEvent
+): Promise<APIGatewayProxyResult> => {
+  const upload = parseDwgUpload(event);
+  if (!upload.ok) return upload.errorResponse;
+  const { filename, content } = upload;
+
+  try {
+    console.info(
+      `Converting DWG to GeoJSON: ${filename} (${content.length} bytes)`
+    );
+    const baseName = filename.replace(/\.dwg$/i, "");
+
+    // Stage 1: DWG -> DXF with the native converter.
+    const dxfResult = await convertDwgToDxf(content, filename);
+    console.info(
+      `DXF ready (${dxfResult.converter}, ${dxfResult.dxf.length} bytes); running GeoJSON pipeline`
+    );
+
+    // Stage 2: DXF -> Freespace GeoJSON via the floorplan engine.
+    const pipeline = await dxfToGeojson(dxfResult.dxf, baseName);
+
+    const geojsonLocalPath = await stashFile(
+      baseName,
+      Buffer.from(pipeline.geojson, "utf-8"),
+      "geojson"
+    );
+
+    // Raw FeatureCollection body on request, when it fits API Gateway.
+    if (
+      event.queryStringParameters?.output === "inline" &&
+      pipeline.geojson.length <= INLINE_LIMIT_BYTES
+    ) {
+      return {
+        statusCode: 200,
+        headers: {
+          "content-type": "application/geo+json",
+          "content-disposition": `attachment; filename="${baseName}.geojson"`,
+          ...corsHeaders,
+        },
+        body: pipeline.geojson,
+      };
+    }
+
+    return response(200, {
+      success: true,
+      filename: `${baseName}.geojson`,
+      dwgVersion: dxfResult.dwgVersion,
+      converter: dxfResult.converter,
+      dxfSizeBytes: dxfResult.dxf.length,
+      geojsonSizeBytes: pipeline.geojson.length,
+      warnings: pipeline.warnings,
+      stats: pipeline.stats,
+      s3DxfKey: pipeline.s3DxfKey,
+      s3GeojsonKey: pipeline.s3GeojsonKey,
+      localPath: geojsonLocalPath,
+      geojson:
+        pipeline.geojson.length <= INLINE_LIMIT_BYTES
+          ? JSON.parse(pipeline.geojson)
+          : null,
+    });
+  } catch (error) {
+    if (error instanceof DwgConversionError) {
+      console.error(`DWG to GeoJSON failed: ${error.message}`);
+      return response(error.statusCode, {
+        success: false,
+        error: "DWG to GeoJSON conversion failed",
+        details: error.message,
+      });
+    }
+    console.error("Unexpected error during DWG to GeoJSON:", error);
+    return response(500, {
+      success: false,
+      error: "Internal server error",
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+};
+
 export const dwgConverterHandler = async (
   event: APIGatewayProxyEvent
 ): Promise<APIGatewayProxyResult> => {
@@ -173,6 +281,9 @@ export const dwgConverterHandler = async (
     return { statusCode: 200, headers: corsHeaders, body: "" };
   }
   if (event.httpMethod === "POST") {
+    if (event.path.endsWith("/convert-dwg-to-geojson")) {
+      return convertToGeojsonEndpoint(event);
+    }
     return convertEndpoint(event);
   }
   return response(405, { success: false, error: "Method not allowed" });

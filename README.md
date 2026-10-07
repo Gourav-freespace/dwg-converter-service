@@ -1,12 +1,33 @@
 # dwg-converter-service
 
-Standalone serverless API that converts AutoCAD DWG drawings to DXF.
-This is step one of the DWG -> DXF -> Freespace GeoJSON pipeline. The DXF
-output feeds the floorplan-editor engine.
+Standalone serverless API that converts AutoCAD DWG drawings to DXF and
+to Freespace GeoJSON. The GeoJSON pipeline runs the floorplan-editor
+engine (copied verbatim under `python/engine/`) in a Python lambda.
 
 ## API
 
-`POST /convert-dwg-to-dxf`
+### `POST /convert-dwg-to-geojson`
+
+The full pipeline: DWG -> DXF (native converter) -> Freespace GeoJSON
+(floorplan engine: unit detection, wall reconstruction, room tracing,
+furniture classification).
+
+- Body: `multipart/form-data`, DWG under the field name `file`.
+- Default response: JSON envelope with `geojson` (the FeatureCollection,
+  inlined when under 5 MB), `stats` (spaces, desks, seats, walls...),
+  `warnings` from the engine, sizes, and the S3 keys / local stash path.
+- `?output=inline`: returns the raw FeatureCollection body
+  (`application/geo+json`) when it fits.
+- A drawing the engine cannot convert returns 422 with the engine's own
+  user-readable reason.
+
+Architecture: the Node lambda converts DWG -> DXF, uploads the DXF to S3,
+and invokes the `dxf-to-geojson` Python lambda (`python/handler.py`),
+which runs the engine and writes the GeoJSON back to S3. Locally
+(`GEOJSON_PY_LOCAL=1`) the Node code spawns the same handler as a CLI via
+`PYTHON_BIN` instead, so no AWS is needed.
+
+### `POST /convert-dwg-to-dxf`
 
 - Body: `multipart/form-data` with the drawing under the field name `file`.
 - The file must have a `.dwg` extension and a valid DWG header (`AC10xx`).
@@ -43,8 +64,14 @@ before redistributing.
 ```bash
 npm install
 brew install libredwg
-cp .env.example .env
+python3 -m venv .venv && .venv/bin/pip install -r python/requirements.txt
+cp .env.example .env   # adjust PYTHON_BIN if needed
 npm run offline
+```
+
+```bash
+curl -X POST "http://localhost:3000/convert-dwg-to-geojson" \
+  -F "file=@DWG/your-drawing.dwg"
 ```
 
 ```bash
@@ -58,15 +85,20 @@ file is present in `DWG/` (drawings are gitignored).
 
 ## Deployment
 
-The native binary ships as a Lambda layer from `layers/dwg-converter/`
-(mounted at `/opt`; `DWG_CONVERTER_PATH` defaults to `/opt/bin/dwg2dxf`).
-Build the binary once before the first deploy:
+Two one-time build steps before the first deploy:
 
 ```bash
-npm run build:layer   # requires Docker; compiles in amazonlinux:2023
+npm run build:layer              # dwg2dxf binary (requires Docker)
+./scripts/build-python-deps.sh   # vendors ezdxf+numpy manylinux wheels
 ```
 
-Then set `DXF_S3_BUCKET` and deploy:
+The native binary ships as a Lambda layer from `layers/dwg-converter/`
+(mounted at `/opt`; `DWG_CONVERTER_PATH` defaults to `/opt/bin/dwg2dxf`).
+The Python lambda packages `python/` with the vendored wheels in
+`python/vendor/`.
+
+Then set `DXF_S3_BUCKET` (required by the GeoJSON pipeline for the
+DXF hand-off between lambdas) and deploy:
 
 ```bash
 npm run deploy:qa

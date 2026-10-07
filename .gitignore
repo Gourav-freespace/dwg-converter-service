@@ -9,3 +9,6 @@ layers/dwg-converter/bin/dwg2dxf
 DWG/*.dwg
 *.log
 .DS_Store
+python/vendor/
+.venv/
+__pycache__/
