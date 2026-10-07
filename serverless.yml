@@ -19,8 +19,10 @@ provider:
         - Effect: "Allow"
           Action:
             - "s3:PutObject"
+          # Unset locally is fine (offline ignores IAM). Deploys must set
+          # DXF_S3_BUCKET; the placeholder keeps the ARN valid either way.
           Resource:
-            - "arn:aws:s3:::${env:DXF_S3_BUCKET}/*"
+            - "arn:aws:s3:::${env:DXF_S3_BUCKET, 'dxf-bucket-not-configured'}/*"
   environment:
     STAGE: ${self:provider.stage}
     REGION: ${self:provider.region}
