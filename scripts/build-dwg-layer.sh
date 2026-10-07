@@ -24,12 +24,23 @@ fi
 
 mkdir -p "$OUT_DIR"
 
+# Corporate TLS interception (e.g. Zscaler): set BUILD_CA_BUNDLE to a PEM
+# file and the container trusts it before dnf/curl run.
+CA_MOUNT=()
+CA_SETUP=":"
+if [ -n "${BUILD_CA_BUNDLE:-}" ]; then
+  CA_MOUNT=(-v "$BUILD_CA_BUNDLE":/corp-ca.pem:ro)
+  CA_SETUP="cp /corp-ca.pem /etc/pki/ca-trust/source/anchors/corp-ca.pem && update-ca-trust"
+fi
+
 echo "Building LibreDWG ${VERSION} dwg2dxf for linux/amd64 (Amazon Linux 2023)..."
 
 docker run --rm --platform linux/amd64 \
   -v "$OUT_DIR":/out \
+  "${CA_MOUNT[@]}" \
   amazonlinux:2023 \
   bash -euxc "
+    ${CA_SETUP}
     dnf install -y -q gcc make tar xz gzip diffutils file
     cd /tmp
     curl -fsSL -o libredwg.tar.xz '${TARBALL_URL}'
@@ -38,7 +49,8 @@ docker run --rm --platform linux/amd64 \
     # Static link so the layer needs no shared libraries.
     ./configure --disable-shared --disable-bindings --disable-python \
                 --disable-dxf-tests --without-perl-install >/dev/null
-    make -j\"\$(nproc)\" dwg2dxf >/dev/null
+    make -C src -j\"\$(nproc)\" >/dev/null
+    make -C programs -j\"\$(nproc)\" dwg2dxf >/dev/null
     strip programs/dwg2dxf
     cp programs/dwg2dxf /out/dwg2dxf
     file /out/dwg2dxf

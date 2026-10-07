@@ -12,3 +12,4 @@ DWG/*.dwg
 python/vendor/
 .venv/
 __pycache__/
+.build/
